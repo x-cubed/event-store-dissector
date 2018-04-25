@@ -1,5 +1,6 @@
 local eventStore = Proto("event-store", "Event Store");
 
+-- Mapping the command IDs to the command names used by Event Store
 local commands = {
   [0x01] = "HeartbeatRequest",
   [0x02] = "HeartbeatResponse",
@@ -44,6 +45,7 @@ local commands = {
   [0xF4] = "NotAuthenticated"
 }
 
+-- Mapping the command IDs to the ProtoBuf schema names used by Event Store
 local schemas = {
   [0x82] = "WriteEvents",
   [0x83] = "WriteEventsCompleted",
@@ -93,7 +95,9 @@ len_F = ProtoField.uint32("event-store.len", "Length")
 cmd_F = ProtoField.uint8("event-store.command", "Command", nil, commands)
 flags_F = ProtoField.uint8("event-store.flags", "Flags", nil, flags)
 correlationId_F = ProtoField.guid("event-store.correlation-id", "Correlation ID")
-eventStore.fields = { len_F, cmd_F, flags_F, correlationId_F }
+username_F = ProtoField.string("event-store.username", "User name")
+password_F = ProtoField.string("event-store.password", "Password")
+eventStore.fields = { len_F, cmd_F, flags_F, correlationId_F, username_F, password_F }
 
 -- Returns the complete length of the Event Store message
 function get_message_len(tvb, pinfo, tree)
@@ -105,31 +109,60 @@ end
 function dissect_message(tvb, pinfo, tree)
   local len = tvb:range(0, 4):le_uint()
   local cmd = tvb(4, 1):le_uint()
+  local flags = tvb(5, 1):le_uint()
   local cmdName = commands[cmd]
-  if cmdName then
-    pinfo.cols.info = cmdName
-  else
-    cmdName = "unknown command " .. cmd
-    pinfo.cols.info = "Unknown command " .. cmd
-  end
+
   pinfo.cols.protocol = "Event Store"
 
+  -- Add the message type to the info column
+  if (string.find(tostring(pinfo.cols.info), "Ack=")) then
+    -- Override the TCP info with just the Event Store info
+    -- FIXME: Find a better way to do this rather than checking for Ack=
+    pinfo.cols.info = cmdName
+  else
+    -- Append to the existing Event Store info
+    if cmdName then
+      pinfo.cols.info:append(", " .. cmdName)
+    else
+      cmdName = "unknown command " .. cmd
+      pinfo.cols.info:append(", command " .. cmd)
+    end
+  end
+
+  -- Add the header fields to the tree
   local subtree = tree:add(eventStore, tvb(), "Event Store, " .. cmdName)
   subtree:add_le(len_F, tvb(0, 4))
   subtree:add(cmd_F, tvb(4, 1))
   subtree:add(flags_F, tvb(5, 1))
   subtree:add(correlationId_F, tvb(6, 16))
 
-  
-  if (len + 4) > HEADER_LENGTH then
+  local dataStart = HEADER_LENGTH
+  if (flags == 0x01) then
+    -- Message contains user credentials for authentication
+    local authTree = subtree:add(eventStore, tvb(), "Authentication")
+
+    local nameStart = HEADER_LENGTH
+    local nameLen = tvb(nameStart, 1):le_uint()
+    authTree:add(username_F, tvb(nameStart + 1, nameLen))
+
+    local pswdStart = nameStart + 1 + nameLen
+    local pswdLen = tvb(pswdStart, 1):le_uint()
+    authTree:add(password_F, tvb(pswdStart + 1, pswdLen))
+
+    dataStart = nameStart + 1 + nameLen + 1 + pswdLen
+  end
+
+  local dataLen = len + 4 - dataStart
+  if dataLen > 0 then
     -- Message also contains a data section serialized using ProtoBuf
     local messageType = schemas[cmd]
     local schema = "EVENTSTORE.CLIENT.MESSAGES." .. string.upper(messageType)  
     local dissector = DissectorTable.get("protobuf.message"):get_dissector(schema)
     if dissector == nil then
-      subtree:add_expert_info(PI_DEBUG, PI_ERROR, "Schema not found: "..schema)
+      local dataTree = subtree:add(tvb(dataStart, dataLen), cmdName)
+      dataTree:add_expert_info(PI_UNDECODED, PI_NOTE, "Unable to parse ProtoBuf message. Is the dex/protobuf_dissector plugin installed?")
     else
-      return dissector:call(tvb(HEADER_LENGTH):tvb(), pinfo, subtree)
+      return dissector:call(tvb(dataStart):tvb(), pinfo, subtree)
     end
   end
   return 0
